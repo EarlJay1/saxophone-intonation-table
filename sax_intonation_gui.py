@@ -61,8 +61,15 @@ STRINGS = {
         'btn_reset':    '\u21ba  Reset',
         'btn_stop':     '\u23f8  Aufnahme pausieren',
         'btn_start':    '\u23fa  Aufnahme starten',
+        'btn_export':   '\u2b07  Exportieren \u25be',
         'btn_txt':      '\u2b07  Export TXT',
         'btn_pdf':      '\u2b07  Export PDF',
+        'export_as_txt':  'Als TXT exportieren',
+        'export_as_pdf':  'Als PDF exportieren',
+        'export_as_csv':  'Als CSV exportieren (Tabellenkalkulation)',
+        'csv_save_title': 'CSV speichern',
+        'csv_filter':     'CSV-Dateien (*.csv)',
+        'csv_saved':      'CSV gespeichert:\n{path}',
         # Tabellen-Header
         'col_fingered':  'Gegriffener Ton',
         'col_sounding':  'Klingender Ton',
@@ -171,8 +178,15 @@ STRINGS = {
         'btn_reset':    '\u21ba  Reset',
         'btn_stop':     '\u23f8  Pause Recording',
         'btn_start':    '\u23fa  Start Recording',
+        'btn_export':   '\u2b07  Export \u25be',
         'btn_txt':      '\u2b07  Export TXT',
         'btn_pdf':      '\u2b07  Export PDF',
+        'export_as_txt':  'Export as TXT',
+        'export_as_pdf':  'Export as PDF',
+        'export_as_csv':  'Export as CSV (Spreadsheet)',
+        'csv_save_title': 'Save CSV',
+        'csv_filter':     'CSV files (*.csv)',
+        'csv_saved':      'CSV saved:\n{path}',
         'col_fingered':  'Fingered Note',
         'col_sounding':  'Sounding Note',
         'col_mean':      '\u00d8 Dev. (ct)',
@@ -367,27 +381,53 @@ class AudioEngine:
         self._buf       = np.zeros(BLOCK_SIZE, dtype=np.float32)
         self._stream    = None
         self.a4         = A4_DEFAULT
-        self.instr_key  = 'eb_alto'   # aktuell ausgewähltes Instrument
+        self.instr_key  = 'eb_alto'
+        self._actual_sr = SAMPLE_RATE   # wird beim Start überschrieben
 
     def start(self, device=None):
         if not AUDIO_OK:
             return
+
+        # Tatsächliche Samplerate des Geräts ermitteln – verhindert Pitch-Fehler
+        # durch implizites Resampling wenn Gerät z.B. auf 48000 Hz läuft
+        try:
+            dev_info = sd.query_devices(device or sd.default.device[0], 'input')
+            actual_sr = int(dev_info['default_samplerate'])
+        except Exception:
+            actual_sr = SAMPLE_RATE
+        self._actual_sr = actual_sr
+
+        # Puffergröße muss mindestens 2× tau_max = 2×(sr/fmin) Samples enthalten
+        buf_size = max(BLOCK_SIZE, int(actual_sr / MIN_FREQ) * 3)
+        self._buf = np.zeros(buf_size, dtype=np.float32)
+
         def cb(indata, frames, ti, st):
             mono = indata[:, 0]
             self._buf = np.roll(self._buf, -frames)
             self._buf[-frames:] = mono
             rms = math.sqrt(float(np.mean(self._buf**2)))
-            if rms < 5e-5:   # etwas empfindlicher für tiefe Töne
+            if rms < 5e-5:
                 return
-            sig = self._buf / (rms + 1e-9)
-            freq, ap = yin_pitch(sig)
+
+            # Adaptives Analysefenster: für hohe Töne kürzeren Ausschnitt nehmen
+            # → verhindert dass Transienten aus alter Puffergeschichte stören
+            sr = self._actual_sr
+            # Schätze Mindestfenstergröße: 6 Perioden des tiefsten erwarteten Tons
+            # Für Mittel-/Hochlage (>200 Hz): ~4096 Samples reichen
+            # Für Basslage (<80 Hz): voller Puffer nötig
+            win = min(len(self._buf), max(4096, int(sr / MIN_FREQ) * 3))
+            sig = self._buf[-win:].copy()
+            sig /= (rms + 1e-9)
+
+            freq, ap = yin_pitch(sig, sr=sr)
             if ap > YIN_THRESHOLD or not (MIN_FREQ < freq < MAX_FREQ):
                 return
             mr, ct = cents_dev(freq, self.a4)
             if mr in SAX_MIDI:
                 self.signals.note_detected.emit(int(mr), freq, ct)
+
         self._stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, blocksize=HOP_SIZE,
+            samplerate=actual_sr, blocksize=HOP_SIZE,
             channels=1, dtype='float32', callback=cb, device=device)
         self._stream.start()
 
@@ -602,6 +642,11 @@ class MainWindow(QMainWindow):
 
         if not AUDIO_OK:
             QMessageBox.warning(self, 'Audio', self._t('audio_error'))
+        elif hasattr(self._engine, '_actual_sr'):
+            # Kurze Info wenn Gerät nicht mit 44100 Hz läuft
+            sr = self._engine._actual_sr
+            if sr != SAMPLE_RATE:
+                pass  # wird in Statuszeile nach erstem Ton sichtbar
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self._refresh_table)
@@ -674,8 +719,7 @@ class MainWindow(QMainWindow):
         self._btn_autotune = self._make_btn(self._t('btn_autotune'), '#1a6b3a', self._on_autotune)
         self._btn_record   = self._make_btn(self._t('btn_stop'),     '#b7770d', self._on_record_toggle)
         self._btn_reset    = self._make_btn(self._t('btn_reset'),    '#c0392b', self._on_reset)
-        self._btn_txt      = self._make_btn(self._t('btn_txt'),      '#2980b9', self._export_txt)
-        self._btn_pdf      = self._make_btn(self._t('btn_pdf'),      '#8e44ad', self._export_pdf)
+        self._btn_export   = self._make_btn(self._t('btn_export'),   '#2980b9', self._on_export_menu)
 
         toolbar.addWidget(self._grp_instr)
         toolbar.addWidget(self._grp_disp)
@@ -685,8 +729,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._btn_autotune)
         toolbar.addWidget(self._btn_record)
         toolbar.addWidget(self._btn_reset)
-        toolbar.addWidget(self._btn_txt)
-        toolbar.addWidget(self._btn_pdf)
+        toolbar.addWidget(self._btn_export)
         root.addLayout(toolbar)
 
         # ── Splitter ──────────────────────────────────────────────────────────
@@ -810,8 +853,7 @@ class MainWindow(QMainWindow):
         self._btn_autotune.setText(self._t('btn_autotune'))
         self._btn_record.setText(self._t('btn_stop' if self._recording else 'btn_start'))
         self._btn_reset.setText(self._t('btn_reset'))
-        self._btn_txt.setText(self._t('btn_txt'))
-        self._btn_pdf.setText(self._t('btn_pdf'))
+        self._btn_export.setText(self._t('btn_export'))
 
         # Tabellen-Header
         self._table.setHorizontalHeaderLabels(self._table_headers())
@@ -1096,6 +1138,103 @@ class MainWindow(QMainWindow):
         self._last_maker = maker
         self._last_model = model
         return maker, model
+
+    # ── Export-Menü ───────────────────────────────────────────────────────────
+    def _on_export_menu(self):
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { background:#1e1e2e; color:#ddd; border:1px solid #444;
+                    font-size:13px; padding:4px; }
+            QMenu::item { padding:8px 24px; border-radius:4px; }
+            QMenu::item:selected { background:#2980b9; color:white; }
+            QMenu::separator { height:1px; background:#444; margin:4px 8px; }
+        """)
+        act_txt = menu.addAction('📄  ' + self._t('export_as_txt'))
+        act_csv = menu.addAction('📊  ' + self._t('export_as_csv'))
+        menu.addSeparator()
+        act_pdf = menu.addAction('📑  ' + self._t('export_as_pdf'))
+
+        btn_rect = self._btn_export.rect()
+        pos = self._btn_export.mapToGlobal(btn_rect.bottomLeft())
+        chosen = menu.exec(pos)
+        if chosen == act_txt:
+            self._export_txt()
+        elif chosen == act_csv:
+            self._export_csv()
+        elif chosen == act_pdf:
+            self._export_pdf()
+
+    # ── Export CSV ────────────────────────────────────────────────────────────
+    def _export_csv(self):
+        model_info = self._ask_instrument_model()
+        if model_info is None:
+            return
+        maker, model = model_info
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, self._t('csv_save_title'),
+            f"intonation_{self.instrument}_{_today()}.csv",
+            self._t('csv_filter'))
+        if not path:
+            return
+
+        transp    = TRANSP_MAP[self.instrument]
+        instr_key = f'instr_long_{self.instrument}'
+        now       = datetime.datetime.now().strftime('%d.%m.%Y %H:%M')
+
+        with self._lock:
+            items = sorted(self.stats.items())
+
+        try:
+            import csv
+            with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                # utf-8-sig = BOM, damit Excel die Datei direkt korrekt öffnet
+                w = csv.writer(f, delimiter=';')
+
+                # Metadaten-Header
+                w.writerow(['Saxophon-Intonationsanalysator'])
+                w.writerow([self._t('txt_instr', name=self._t(instr_key))])
+                if maker:
+                    w.writerow([self._t('txt_maker', maker=maker)])
+                if model:
+                    w.writerow([self._t('txt_model', model=model)])
+                transp_txt = (self._t('txt_transp', note=CHROMA[transp % 12])
+                              if transp else self._t('txt_no_transp'))
+                w.writerow([transp_txt])
+                w.writerow([self._t('txt_a4', hz=self._engine.a4)])
+                w.writerow([self._t('txt_date', dt=now)])
+                w.writerow([])
+
+                # Spaltenköpfe
+                w.writerow([
+                    self._t('pdf_col_finger'),
+                    self._t('pdf_col_sound'),
+                    self._t('col_mean'),
+                    self._t('col_std'),
+                    self._t('col_n'),
+                ])
+
+                # Datenzeilen – Dezimalkomma für deutsche Locale
+                for midi_kl, st in items:
+                    midi_gr = midi_kl - transp
+                    mean_s  = f"{st.mean:.2f}".replace('.', ',')
+                    std_s   = f"{st.std:.2f}".replace('.', ',')
+                    w.writerow([
+                        midi_note_name(midi_gr),
+                        midi_note_name(midi_kl),
+                        mean_s,
+                        std_s,
+                        st.n,
+                    ])
+
+                w.writerow([])
+                total = sum(s.n for _, s in items)
+                w.writerow([self._t('txt_total', total=total, notes=len(items))])
+
+            QMessageBox.information(self, self._t('export_title'),
+                                    self._t('csv_saved', path=path))
+        except Exception as e:
+            QMessageBox.critical(self, self._t('err_title'), str(e))
 
     # ── Export TXT ────────────────────────────────────────────────────────────
     def _export_txt(self):
